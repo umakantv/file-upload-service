@@ -91,6 +91,12 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 		json.NewEncoder(w).Encode(errs.NewValidationError("bucket_id is required and must be a positive integer"))
 		return
 	}
+	if req.Key == "" {
+		h.logRequest(ctx, "error", "Missing required field: key")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("key is required"))
+		return
+	}
 	if req.FileName == "" {
 		h.logRequest(ctx, "error", "Missing required field: file_name")
 		w.WriteHeader(http.StatusBadRequest)
@@ -132,9 +138,10 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 	}
 	clientID := auth.Client
 
-	// Verify the bucket exists, belongs to the authenticated client, and is not archived.
-	// Also fetch the bucket name for building the storage path.
-	var bucketClientID, bucketName string
+	// Verify the bucket exists, belongs to the authenticated client, and is not archived
+	// Also fetch the bucket name for folder structure
+	var bucketClientID string
+	var bucketName string
 	var bucketArchived int
 	err := h.db.QueryRow(
 		"SELECT client_id, name, archived FROM buckets WHERE id = ?",
@@ -162,33 +169,35 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
-	// Fetch the client's human-readable name for building the storage path.
+	// Fetch the client name for folder structure
 	var clientName string
-	if err := h.db.QueryRow(
-		"SELECT name FROM clients WHERE client_id = ?", clientID,
-	).Scan(&clientName); err != nil {
+	err = h.db.QueryRow("SELECT name FROM clients WHERE client_id = ?", clientID).Scan(&clientName)
+	if err != nil {
 		h.logRequest(ctx, "error", "Failed to fetch client name", zap.String("client_id", clientID), zap.Error(err))
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to resolve client"))
+		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to fetch client information"))
 		return
 	}
 
 	h.logRequest(ctx, "info", "Generating signed URL",
 		zap.String("file_name", req.FileName),
 		zap.String("client_id", clientID),
-		zap.String("client_name", clientName),
 		zap.Int("bucket_id", req.BucketID),
-		zap.String("bucket_name", bucketName),
+		zap.String("key", req.Key),
 	)
 
 	// Generate file ID
 	fileID := uuid.New().String()
 	now := time.Now()
 
-	// Insert file record into database
+	// Build the resolved file path: <client_name>/<bucket_name>/<key>
+	// The key may contain slashes for deeper nesting (e.g. "invoices/2024/receipt.pdf")
+	filePath := filepath.Join(clientName, bucketName, req.Key)
+
+	// Insert file record into database (including the key)
 	_, err = h.db.Exec(
-		"INSERT INTO files (id, file_name, file_size, mimetype, client_id, bucket_id, owner_entity_type, owner_entity_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		fileID, req.FileName, req.FileSize, req.Mimetype, clientID, req.BucketID, req.OwnerEntityType, req.OwnerEntityID, now, now,
+		"INSERT INTO files (id, file_name, file_size, mimetype, client_id, bucket_id, key, owner_entity_type, owner_entity_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		fileID, req.FileName, req.FileSize, req.Mimetype, clientID, req.BucketID, req.Key, req.OwnerEntityType, req.OwnerEntityID, now, now,
 	)
 	if err != nil {
 		h.logRequest(ctx, "error", "Failed to create file record", zap.Error(err))
@@ -200,17 +209,16 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 	// Generate upload token
 	uploadToken := generateUploadToken()
 
-	// Store upload token data in Redis with 15 minute TTL
-	// Pass the struct directly - the cache layer handles JSON serialization
+	// Store upload token data in Redis with 15 minute TTL.
+	// FilePath carries the full resolved path so the upload handler needs no extra DB lookups.
 	tokenData := models.UploadTokenData{
 		FileID:          fileID,
 		FileName:        req.FileName,
 		FileSize:        req.FileSize,
 		Mimetype:        req.Mimetype,
 		ClientID:        clientID,
-		ClientName:      clientName,
 		BucketID:        req.BucketID,
-		BucketName:      bucketName,
+		FilePath:        filePath,
 		OwnerEntityType: req.OwnerEntityType,
 		OwnerEntityID:   req.OwnerEntityID,
 	}
@@ -319,17 +327,20 @@ func (h *FileHandler) UploadFile(ctx context.Context, w http.ResponseWriter, r *
 		return
 	}
 
-	// Build nested storage directory: uploads/<client_name>/<bucket_name>
-	uploadsDir := filepath.Join("./uploads", tokenData.ClientName, tokenData.BucketName)
-	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
-		h.logRequest(ctx, "error", "Failed to create uploads directory", zap.Error(err))
+	// Resolve the full on-disk path from the token.
+	// tokenData.FilePath is <client_name>/<bucket_name>/<key> where key may contain slashes.
+	// The actual file is stored at that exact path under ./uploads/.
+	absFilePath := filepath.Join("./uploads", tokenData.FilePath)
+
+	// Ensure all parent directories exist (key may introduce extra nesting)
+	if err := os.MkdirAll(filepath.Dir(absFilePath), 0755); err != nil {
+		h.logRequest(ctx, "error", "Failed to create nested upload directory", zap.Error(err))
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to prepare upload storage"))
 		return
 	}
 
-	// Store the file at uploads/<client_name>/<bucket_name>/<file_id>
-	filePath := filepath.Join(uploadsDir, tokenData.FileID)
+	filePath := absFilePath
 
 	// Create destination file
 	destFile, err := os.Create(filePath)
@@ -412,21 +423,19 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 		zap.String("client_id", clientID),
 	)
 
-	// Look up the file record joined with bucket and client names so we can
-	// reconstruct the exact storage path without guessing.
+	// Look up the file record — verify it exists and belongs to this client.
+	// Also fetch client name, bucket name, and key to reconstruct the storage path.
 	var file models.File
-	var clientName, bucketName string
-	err := h.db.QueryRow(`
-		SELECT f.id, f.file_name, f.mimetype, f.client_id, f.bucket_id,
-		       c.name AS client_name, b.name AS bucket_name
-		FROM files f
-		JOIN buckets b ON b.id = f.bucket_id
-		JOIN clients c ON c.client_id = f.client_id
-		WHERE f.id = ? AND f.deleted_at IS NULL
-	`, req.FileID).Scan(
-		&file.ID, &file.FileName, &file.Mimetype, &file.ClientID, &file.BucketID,
-		&clientName, &bucketName,
-	)
+	var clientName string
+	var bucketName string
+	err := h.db.QueryRow(
+		`SELECT f.id, f.file_name, f.mimetype, f.client_id, f.bucket_id, f.key, c.name, b.name
+		 FROM files f
+		 JOIN clients c ON f.client_id = c.client_id
+		 JOIN buckets b ON f.bucket_id = b.id
+		 WHERE f.id = ? AND f.deleted_at IS NULL`,
+		req.FileID,
+	).Scan(&file.ID, &file.FileName, &file.Mimetype, &file.ClientID, &file.BucketID, &file.Key, &clientName, &bucketName)
 	if err != nil {
 		h.logRequest(ctx, "info", "File not found", zap.String("file_id", req.FileID), zap.Error(err))
 		w.WriteHeader(http.StatusNotFound)
@@ -446,10 +455,16 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 		return
 	}
 
-	// Reconstruct the nested storage path and verify the file exists on disk
-	filePath := filepath.Join("./uploads", clientName, bucketName, file.ID)
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		h.logRequest(ctx, "error", "File not found on disk", zap.String("file_id", file.ID), zap.String("path", filePath))
+	// Reconstruct the storage path: <client_name>/<bucket_name>/<key>
+	resolvedFilePath := filepath.Join(clientName, bucketName, file.Key)
+
+	// Verify the file exists on disk
+	absFilePath := filepath.Join("./uploads", resolvedFilePath)
+	if _, err := os.Stat(absFilePath); os.IsNotExist(err) {
+		h.logRequest(ctx, "error", "File not found on disk",
+			zap.String("file_id", file.ID),
+			zap.String("path", absFilePath),
+		)
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(errs.NewNotFoundError("File content not found"))
 		return
@@ -459,15 +474,15 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 	downloadToken := generateDownloadToken()
 	ttl := 15 * time.Minute
 
-	// Store token data in Redis — include the resolved storage path so the
-	// download handler can open the file without any further DB lookups.
+	// Store token data in Redis.
+	// FilePath carries the full resolved path so the download handler needs no extra DB lookups.
 	tokenData := models.DownloadTokenData{
-		FileID:      file.ID,
-		FileName:    file.FileName,
-		Mimetype:    file.Mimetype,
-		ClientID:    clientID,
-		BucketID:    file.BucketID,
-		StoragePath: filePath,
+		FileID:   file.ID,
+		FileName: file.FileName,
+		Mimetype: file.Mimetype,
+		ClientID: clientID,
+		BucketID: file.BucketID,
+		FilePath: resolvedFilePath,
 	}
 
 	if err := h.cache.Set("download:"+downloadToken, tokenData, ttl); err != nil {
@@ -484,10 +499,7 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 	h.logRequest(ctx, "info", "Download signed URL generated successfully",
 		zap.String("file_id", file.ID),
 		zap.String("client_id", clientID),
-		zap.String("client_name", clientName),
 		zap.Int("bucket_id", file.BucketID),
-		zap.String("bucket_name", bucketName),
-		zap.String("storage_path", filePath),
 	)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -536,12 +548,12 @@ func (h *FileHandler) DownloadFile(ctx context.Context, w http.ResponseWriter, r
 		return
 	}
 
-	// Open the file from disk using the pre-resolved nested storage path
-	f, err := os.Open(tokenData.StoragePath)
+	// Open the file from disk using the resolved path stored in the token
+	filePath := filepath.Join("./uploads", tokenData.FilePath)
+	f, err := os.Open(filePath)
 	if err != nil {
 		h.logRequest(ctx, "error", "File not found on disk",
 			zap.String("file_id", tokenData.FileID),
-			zap.String("storage_path", tokenData.StoragePath),
 			zap.Error(err),
 		)
 		w.WriteHeader(http.StatusNotFound)
@@ -558,7 +570,6 @@ func (h *FileHandler) DownloadFile(ctx context.Context, w http.ResponseWriter, r
 		zap.String("file_name", tokenData.FileName),
 		zap.String("client_id", tokenData.ClientID),
 		zap.Int("bucket_id", tokenData.BucketID),
-		zap.String("storage_path", tokenData.StoragePath),
 	)
 
 	// Set response headers for file download

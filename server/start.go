@@ -101,6 +101,7 @@ func StartServer() {
 	clientHandler := handlers.NewClientHandler(dbConn)
 	fileHandler := handlers.NewFileHandler(dbConn, cache)
 	bucketHandler := handlers.NewBucketHandler(dbConn)
+	publicFileHandler := handlers.NewPublicFileHandler(dbConn)
 
 	// Create HTTP server with authentication
 	server := httpserver.New("8080", authChecker.CheckAuth)
@@ -207,12 +208,21 @@ func StartServer() {
 		AuthType: "none",
 	}, httpserver.HandlerFunc(fileHandler.DownloadFile))
 
+	// Public file access endpoint (no auth, CORS enforced if configured)
+	server.Register(httpserver.Route{
+		Name:     "ServePublicFile",
+		Method:   "GET",
+		Path:     "/files/{bucket_name}/{file_path:.*}",
+		AuthType: "none",
+	}, httpserver.HandlerFunc(publicFileHandler.ServePublicFile))
+
 	logger.Info("File Upload Service started on port 8080")
 	logger.Info("Health check: GET /health")
 	logger.Info("Client API: POST/GET /clients, GET /clients/{id} (Bearer auth)")
 	logger.Info("Bucket API: POST/GET /buckets, GET/PUT /buckets/{id}, POST /buckets/{id}/archive (Basic auth)")
 	logger.Info("File API: POST /files/signed-url (Basic auth), POST /files/upload (token in URL)")
 	logger.Info("File API: POST /files/download-url (Basic auth), GET /files/download (token in URL)")
+	logger.Info("Public File API: GET /files/{bucket_name}/{file_path} (no auth, CORS enforced)")
 
 	// Start server
 	if err := server.Start(); err != nil {

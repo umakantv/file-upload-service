@@ -2,6 +2,8 @@
 
 These tests cover the file download signed URL generation and the download endpoint.
 
+Files are stored using the key provided at upload time. The resolved on-disk path is `./uploads/<client_name>/<bucket_name>/<key>` — the key may contain slashes for deeper nesting (e.g. `invoices/2024/january/receipt.pdf`). The download endpoint automatically reconstructs this path from the database record.
+
 ## Prerequisites
 
 1. Redis server running:
@@ -103,11 +105,13 @@ curl -s -X POST http://localhost:8080/buckets \
 export BUCKET_ID=$(cat /tmp/bucket.json | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
 
 # Step 3: Generate upload signed URL (Basic auth)
+# key can be a simple name or a nested path like "reports/2024/sample.pdf"
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
   -d "{
     \"bucket_id\": $BUCKET_ID,
+    \"key\": \"sample.pdf\",
     \"file_name\": \"sample.pdf\",
     \"file_size\": 10485760,
     \"mimetype\": \"application/pdf\",

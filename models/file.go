@@ -7,22 +7,24 @@ import (
 
 // File represents a file record in the system
 type File struct {
-	ID              string         `json:"id" db:"id"`
-	FileName        string         `json:"file_name" db:"file_name"`
-	FileSize        int64          `json:"file_size" db:"file_size"`
-	Mimetype        string         `json:"mimetype" db:"mimetype"`
-	ClientID        string         `json:"client_id" db:"client_id"`
-	BucketID        int            `json:"bucket_id" db:"bucket_id"`
-	OwnerEntityType string         `json:"owner_entity_type" db:"owner_entity_type"`
-	OwnerEntityID   string         `json:"owner_entity_id" db:"owner_entity_id"`
-	CreatedAt       time.Time      `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time      `json:"updated_at" db:"updated_at"`
-	DeletedAt       sql.NullTime   `json:"deleted_at,omitempty" db:"deleted_at"`
+	ID              string       `json:"id" db:"id"`
+	FileName        string       `json:"file_name" db:"file_name"`
+	FileSize        int64        `json:"file_size" db:"file_size"`
+	Mimetype        string       `json:"mimetype" db:"mimetype"`
+	ClientID        string       `json:"client_id" db:"client_id"`
+	BucketID        int          `json:"bucket_id" db:"bucket_id"`
+	Key             string       `json:"key" db:"key"`
+	OwnerEntityType string       `json:"owner_entity_type" db:"owner_entity_type"`
+	OwnerEntityID   string       `json:"owner_entity_id" db:"owner_entity_id"`
+	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt       sql.NullTime `json:"deleted_at,omitempty" db:"deleted_at"`
 }
 
 // CreateSignedURLRequest represents the request to generate a signed URL for upload
 type CreateSignedURLRequest struct {
 	BucketID        int    `json:"bucket_id"`
+	Key             string `json:"key"`
 	FileName        string `json:"file_name"`
 	FileSize        int64  `json:"file_size"`
 	Mimetype        string `json:"mimetype"`
@@ -44,9 +46,10 @@ type UploadTokenData struct {
 	FileSize        int64  `json:"file_size"`
 	Mimetype        string `json:"mimetype"`
 	ClientID        string `json:"client_id"`
-	ClientName      string `json:"client_name"`
 	BucketID        int    `json:"bucket_id"`
-	BucketName      string `json:"bucket_name"`
+	// FilePath is the resolved storage path relative to ./uploads/
+	// Format: <client_name>/<bucket_name>/<key>  (key may itself contain slashes)
+	FilePath        string `json:"file_path"`
 	OwnerEntityType string `json:"owner_entity_type"`
 	OwnerEntityID   string `json:"owner_entity_id"`
 }
@@ -58,10 +61,12 @@ type GenerateDownloadSignedURLRequest struct {
 
 // DownloadTokenData represents the data stored in Redis for download validation
 type DownloadTokenData struct {
-	FileID      string `json:"file_id"`
-	FileName    string `json:"file_name"`
-	Mimetype    string `json:"mimetype"`
-	ClientID    string `json:"client_id"`
-	BucketID    int    `json:"bucket_id"`
-	StoragePath string `json:"storage_path"`
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	Mimetype string `json:"mimetype"`
+	ClientID string `json:"client_id"`
+	BucketID int    `json:"bucket_id"`
+	// FilePath is the resolved storage path relative to ./uploads/
+	// Format: <client_name>/<bucket_name>/<key>  (key may itself contain slashes)
+	FilePath string `json:"file_path"`
 }
