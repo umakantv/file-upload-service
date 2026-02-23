@@ -6,3 +6,4 @@ ALTER TABLE files ADD COLUMN bucket_id INTEGER NOT NULL DEFAULT 0 REFERENCES buc
 
 -- Create index on bucket_id for faster lookups
 CREATE INDEX IF NOT EXISTS idx_files_bucket_id ON files(bucket_id);
+

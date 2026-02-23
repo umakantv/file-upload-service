@@ -91,6 +91,64 @@ func validateCORSPolicy(raw json.RawMessage) (json.RawMessage, error) {
 	return clean, nil
 }
 
+// validatePublicPaths validates that the public_paths field is a valid JSON array of strings
+// Returns the raw JSON to store (defaults to "[]" if nil/empty)
+func validatePublicPaths(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return json.RawMessage("[]"), nil
+	}
+	// Ensure it is a valid JSON array of strings
+	var paths []string
+	if err := json.Unmarshal(raw, &paths); err != nil {
+		return nil, err
+	}
+	// Re-marshal to ensure clean storage
+	clean, err := json.Marshal(paths)
+	if err != nil {
+		return nil, err
+	}
+	return clean, nil
+}
+
+// matchesPublicPath checks if a given file key matches any of the public path patterns
+// Supports wildcards: * matches any sequence of characters except /
+// Example patterns: "images/*", "*.jpg", "public/*"
+func matchesPublicPath(key string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matchPattern(key, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchPattern matches a key against a pattern with * wildcards
+func matchPattern(key, pattern string) bool {
+	// Simple wildcard matching: * matches any sequence of characters
+	if pattern == "*" || pattern == "*/*" || pattern == "**" {
+		return true
+	}
+	
+	// Convert pattern to regex
+	// Escape special regex characters except *
+	regexPattern := "^"
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch c {
+		case '*':
+			regexPattern += "[^/]*"
+		case '.', '+', '?', '(', ')', '[', ']', '{', '}', '^', '$', '|', '\\':
+			regexPattern += "\\" + string(c)
+		default:
+			regexPattern += string(c)
+		}
+	}
+	regexPattern += "$"
+	
+	matched, _ := regexp.MatchString(regexPattern, key)
+	return matched
+}
+
 // CreateBucket handles POST /buckets - create a new bucket for the authenticated client
 func (h *BucketHandler) CreateBucket(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	clientID, ok := h.getClientID(ctx)
@@ -132,12 +190,21 @@ func (h *BucketHandler) CreateBucket(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	// Validate and normalise public paths
+	publicPaths, err := validatePublicPaths(req.PublicPaths)
+	if err != nil {
+		h.logRequest(ctx, "error", "Invalid public_paths", zap.Error(err))
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("public_paths must be a valid JSON array of strings"))
+		return
+	}
+
 	h.logRequest(ctx, "info", "Creating bucket", zap.String("name", req.Name), zap.String("client_id", clientID))
 
 	now := time.Now()
 	result, err := h.db.Exec(
-		"INSERT INTO buckets (name, client_id, cors_policy, archived, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)",
-		req.Name, clientID, string(corsPolicy), now, now,
+		"INSERT INTO buckets (name, client_id, cors_policy, public_paths, archived, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?)",
+		req.Name, clientID, string(corsPolicy), string(publicPaths), now, now,
 	)
 	if err != nil {
 		// SQLite UNIQUE constraint violation
@@ -158,13 +225,14 @@ func (h *BucketHandler) CreateBucket(ctx context.Context, w http.ResponseWriter,
 	h.logRequest(ctx, "info", "Bucket created successfully", zap.Int64("bucket_id", id), zap.String("name", req.Name))
 
 	bucket := models.Bucket{
-		ID:         int(id),
-		Name:       req.Name,
-		ClientID:   clientID,
-		CORSPolicy: corsPolicy,
-		Archived:   false,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		ID:          int(id),
+		Name:        req.Name,
+		ClientID:    clientID,
+		CORSPolicy:  corsPolicy,
+		PublicPaths: publicPaths,
+		Archived:    false,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -185,7 +253,7 @@ func (h *BucketHandler) GetBuckets(ctx context.Context, w http.ResponseWriter, r
 	h.logRequest(ctx, "info", "Listing buckets", zap.String("client_id", clientID))
 
 	rows, err := h.db.Query(
-		"SELECT id, name, client_id, cors_policy, archived, created_at, updated_at FROM buckets WHERE client_id = ? ORDER BY created_at DESC",
+		"SELECT id, name, client_id, cors_policy, public_paths, archived, created_at, updated_at FROM buckets WHERE client_id = ? ORDER BY created_at DESC",
 		clientID,
 	)
 	if err != nil {
@@ -200,12 +268,14 @@ func (h *BucketHandler) GetBuckets(ctx context.Context, w http.ResponseWriter, r
 	for rows.Next() {
 		var b models.Bucket
 		var corsPolicyStr string
+		var publicPathsStr string
 		var archivedInt int
-		if err := rows.Scan(&b.ID, &b.Name, &b.ClientID, &corsPolicyStr, &archivedInt, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.Name, &b.ClientID, &corsPolicyStr, &publicPathsStr, &archivedInt, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			h.logRequest(ctx, "error", "Failed to scan bucket row", zap.Error(err))
 			continue
 		}
 		b.CORSPolicy = json.RawMessage(corsPolicyStr)
+		b.PublicPaths = json.RawMessage(publicPathsStr)
 		b.Archived = archivedInt != 0
 		buckets = append(buckets, b)
 	}
@@ -243,11 +313,12 @@ func (h *BucketHandler) GetBucket(ctx context.Context, w http.ResponseWriter, r 
 
 	var b models.Bucket
 	var corsPolicyStr string
+	var publicPathsStr string
 	var archivedInt int
 	err = h.db.QueryRow(
-		"SELECT id, name, client_id, cors_policy, archived, created_at, updated_at FROM buckets WHERE id = ? AND client_id = ?",
+		"SELECT id, name, client_id, cors_policy, public_paths, archived, created_at, updated_at FROM buckets WHERE id = ? AND client_id = ?",
 		id, clientID,
-	).Scan(&b.ID, &b.Name, &b.ClientID, &corsPolicyStr, &archivedInt, &b.CreatedAt, &b.UpdatedAt)
+	).Scan(&b.ID, &b.Name, &b.ClientID, &corsPolicyStr, &publicPathsStr, &archivedInt, &b.CreatedAt, &b.UpdatedAt)
 
 	if err == sql.ErrNoRows {
 		h.logRequest(ctx, "info", "Bucket not found", zap.Int("bucket_id", id))
@@ -263,6 +334,7 @@ func (h *BucketHandler) GetBucket(ctx context.Context, w http.ResponseWriter, r 
 	}
 
 	b.CORSPolicy = json.RawMessage(corsPolicyStr)
+	b.PublicPaths = json.RawMessage(publicPathsStr)
 	b.Archived = archivedInt != 0
 
 	h.logRequest(ctx, "info", "Bucket retrieved successfully", zap.Int("bucket_id", id))
@@ -307,12 +379,20 @@ func (h *BucketHandler) UpdateBucket(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	publicPaths, err := validatePublicPaths(req.PublicPaths)
+	if err != nil {
+		h.logRequest(ctx, "error", "Invalid public_paths", zap.Error(err))
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("public_paths must be a valid JSON array of strings"))
+		return
+	}
+
 	h.logRequest(ctx, "info", "Updating bucket", zap.Int("bucket_id", id), zap.String("client_id", clientID))
 
 	now := time.Now()
 	result, err := h.db.Exec(
-		"UPDATE buckets SET cors_policy = ?, updated_at = ? WHERE id = ? AND client_id = ? AND archived = 0",
-		string(corsPolicy), now, id, clientID,
+		"UPDATE buckets SET cors_policy = ?, public_paths = ?, updated_at = ? WHERE id = ? AND client_id = ? AND archived = 0",
+		string(corsPolicy), string(publicPaths), now, id, clientID,
 	)
 	if err != nil {
 		h.logRequest(ctx, "error", "Failed to update bucket", zap.Error(err))
@@ -342,12 +422,14 @@ func (h *BucketHandler) UpdateBucket(ctx context.Context, w http.ResponseWriter,
 	// Fetch the updated bucket to return
 	var b models.Bucket
 	var corsPolicyStr string
+	var publicPathsStr string
 	var archivedInt int
 	h.db.QueryRow(
-		"SELECT id, name, client_id, cors_policy, archived, created_at, updated_at FROM buckets WHERE id = ?",
+		"SELECT id, name, client_id, cors_policy, public_paths, archived, created_at, updated_at FROM buckets WHERE id = ?",
 		id,
-	).Scan(&b.ID, &b.Name, &b.ClientID, &corsPolicyStr, &archivedInt, &b.CreatedAt, &b.UpdatedAt)
+	).Scan(&b.ID, &b.Name, &b.ClientID, &corsPolicyStr, &publicPathsStr, &archivedInt, &b.CreatedAt, &b.UpdatedAt)
 	b.CORSPolicy = json.RawMessage(corsPolicyStr)
+	b.PublicPaths = json.RawMessage(publicPathsStr)
 	b.Archived = archivedInt != 0
 
 	h.logRequest(ctx, "info", "Bucket updated successfully", zap.Int("bucket_id", id))
@@ -412,12 +494,14 @@ func (h *BucketHandler) ArchiveBucket(ctx context.Context, w http.ResponseWriter
 	// Fetch and return the archived bucket
 	var b models.Bucket
 	var corsPolicyStr string
+	var publicPathsStr string
 	var archivedInt int
 	h.db.QueryRow(
-		"SELECT id, name, client_id, cors_policy, archived, created_at, updated_at FROM buckets WHERE id = ?",
+		"SELECT id, name, client_id, cors_policy, public_paths, archived, created_at, updated_at FROM buckets WHERE id = ?",
 		id,
-	).Scan(&b.ID, &b.Name, &b.ClientID, &corsPolicyStr, &archivedInt, &b.CreatedAt, &b.UpdatedAt)
+	).Scan(&b.ID, &b.Name, &b.ClientID, &corsPolicyStr, &publicPathsStr, &archivedInt, &b.CreatedAt, &b.UpdatedAt)
 	b.CORSPolicy = json.RawMessage(corsPolicyStr)
+	b.PublicPaths = json.RawMessage(publicPathsStr)
 	b.Archived = archivedInt != 0
 
 	w.Header().Set("Content-Type", "application/json")
