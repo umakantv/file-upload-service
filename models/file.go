@@ -44,7 +44,9 @@ type UploadTokenData struct {
 	FileSize        int64  `json:"file_size"`
 	Mimetype        string `json:"mimetype"`
 	ClientID        string `json:"client_id"`
+	ClientName      string `json:"client_name"`
 	BucketID        int    `json:"bucket_id"`
+	BucketName      string `json:"bucket_name"`
 	OwnerEntityType string `json:"owner_entity_type"`
 	OwnerEntityID   string `json:"owner_entity_id"`
 }
@@ -56,9 +58,10 @@ type GenerateDownloadSignedURLRequest struct {
 
 // DownloadTokenData represents the data stored in Redis for download validation
 type DownloadTokenData struct {
-	FileID   string `json:"file_id"`
-	FileName string `json:"file_name"`
-	Mimetype string `json:"mimetype"`
-	ClientID string `json:"client_id"`
-	BucketID int    `json:"bucket_id"`
+	FileID      string `json:"file_id"`
+	FileName    string `json:"file_name"`
+	Mimetype    string `json:"mimetype"`
+	ClientID    string `json:"client_id"`
+	BucketID    int    `json:"bucket_id"`
+	StoragePath string `json:"storage_path"`
 }

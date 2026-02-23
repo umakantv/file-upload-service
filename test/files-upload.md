@@ -4,6 +4,12 @@ These tests cover the file upload endpoint that uses the token from the URL (no 
 
 Every upload is associated with a bucket. The bucket is chosen at signed URL generation time and is carried through the upload token.
 
+Files are stored on disk in a nested directory structure:
+```
+uploads/<client_name>/<bucket_name>/<file_id>
+```
+For example: `uploads/my-upload-client/my-uploads/550e8400-e29b-41d4-a716-446655440000`
+
 ## Prerequisites
 
 1. Start Redis server locally:
@@ -46,9 +52,11 @@ curl -s -X POST "http://localhost:8080/files/upload?token=102c69213109d22661c87b
   "file_name": "document.pdf",
   "file_size": 1048576,
   "bucket_id": 1,
-  "saved_path": "./uploads/550e8400-e29b-41d4-a716-446655440000"
+  "saved_path": "uploads/my-upload-client/my-uploads/550e8400-e29b-41d4-a716-446655440000"
 }
 ```
+
+The `saved_path` reflects the nested structure `uploads/<client_name>/<bucket_name>/<file_id>`.
 
 **Note:** The token is deleted after successful upload (one-time use).
 
