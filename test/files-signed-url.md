@@ -2,6 +2,8 @@
 
 These tests cover the file upload signed URL generation endpoint.
 
+Every file must be associated with a **bucket**. The bucket must belong to the authenticated client and must not be archived.
+
 ## Prerequisites
 
 1. Start Redis server locally:
@@ -15,7 +17,13 @@ export PATH=$PATH:/usr/local/go/bin
 go run main.go
 ```
 
-3. Create a client to get client_id and client_secret (see `clients.md`).
+3. Create a client (see `clients.md`) and a bucket (see `buckets.md`), then export credentials:
+```bash
+export CLIENT_ID="client_..."
+export CLIENT_SECRET="secret_..."
+export CREDENTIALS=$(echo -n "$CLIENT_ID:$CLIENT_SECRET" | base64)
+export BUCKET_ID=1   # use the id returned when creating the bucket
+```
 
 ---
 
@@ -24,7 +32,6 @@ go run main.go
 File operations use **Basic auth** with `client_id:client_secret` encoded in base64.
 
 ```bash
-# Encode client_id:client_secret in base64
 export CREDENTIALS=$(echo -n "your-client-id:your-client-secret" | base64)
 ```
 
@@ -38,13 +45,11 @@ Generate a signed URL for uploading a file. The URL is valid for 15 minutes.
 
 ### Request
 ```bash
-# First, encode your client credentials
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
   -d '{
+    "bucket_id": 1,
     "file_name": "document.pdf",
     "file_size": 1048576,
     "mimetype": "application/pdf",
@@ -66,16 +71,124 @@ curl -s -X POST http://localhost:8080/files/signed-url \
 
 ---
 
-## 2. Validation Error - Missing file_name
+## 2. Validation Error - Missing bucket_id
 
 ### Request
 ```bash
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
   -d '{
+    "file_name": "document.pdf",
+    "file_size": 1048576,
+    "mimetype": "application/pdf",
+    "owner_entity_type": "user",
+    "owner_entity_id": "user-123"
+  }'
+```
+
+### Expected Response (400 Bad Request)
+```json
+{
+  "Code": 422,
+  "Message": "bucket_id is required and must be a positive integer"
+}
+```
+
+---
+
+## 3. Validation Error - Bucket Not Found
+
+### Request
+```bash
+curl -s -X POST http://localhost:8080/files/signed-url \
+  -H "Authorization: Basic $CREDENTIALS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bucket_id": 99999,
+    "file_name": "document.pdf",
+    "file_size": 1048576,
+    "mimetype": "application/pdf",
+    "owner_entity_type": "user",
+    "owner_entity_id": "user-123"
+  }'
+```
+
+### Expected Response (404 Not Found)
+```json
+{
+  "Code": 404,
+  "Message": "Bucket not found"
+}
+```
+
+---
+
+## 4. Validation Error - Bucket Belongs to Another Client (403 Forbidden)
+
+### Request
+```bash
+# Use a bucket_id that belongs to a different client
+curl -s -X POST http://localhost:8080/files/signed-url \
+  -H "Authorization: Basic $CREDENTIALS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bucket_id": 2,
+    "file_name": "document.pdf",
+    "file_size": 1048576,
+    "mimetype": "application/pdf",
+    "owner_entity_type": "user",
+    "owner_entity_id": "user-123"
+  }'
+```
+
+### Expected Response (403 Forbidden)
+```json
+{
+  "Code": 403,
+  "Message": "Access denied: bucket does not belong to your account"
+}
+```
+
+---
+
+## 5. Validation Error - Bucket is Archived (409 Conflict)
+
+### Request
+```bash
+# Use the id of a bucket that has been archived
+curl -s -X POST http://localhost:8080/files/signed-url \
+  -H "Authorization: Basic $CREDENTIALS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bucket_id": 1,
+    "file_name": "document.pdf",
+    "file_size": 1048576,
+    "mimetype": "application/pdf",
+    "owner_entity_type": "user",
+    "owner_entity_id": "user-123"
+  }'
+```
+
+### Expected Response (409 Conflict)
+```json
+{
+  "Code": 422,
+  "Message": "Cannot upload to an archived bucket"
+}
+```
+
+---
+
+## 6. Validation Error - Missing file_name
+
+### Request
+```bash
+curl -s -X POST http://localhost:8080/files/signed-url \
+  -H "Authorization: Basic $CREDENTIALS" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bucket_id": 1,
     "file_size": 1048576,
     "mimetype": "application/pdf",
     "owner_entity_type": "user",
@@ -93,16 +206,15 @@ curl -s -X POST http://localhost:8080/files/signed-url \
 
 ---
 
-## 3. Validation Error - Invalid file_size
+## 7. Validation Error - Invalid file_size
 
 ### Request
 ```bash
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
   -d '{
+    "bucket_id": 1,
     "file_name": "document.pdf",
     "file_size": 0,
     "mimetype": "application/pdf",
@@ -121,16 +233,15 @@ curl -s -X POST http://localhost:8080/files/signed-url \
 
 ---
 
-## 4. Validation Error - Missing mimetype
+## 8. Validation Error - Missing mimetype
 
 ### Request
 ```bash
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
   -d '{
+    "bucket_id": 1,
     "file_name": "document.pdf",
     "file_size": 1048576,
     "owner_entity_type": "user",
@@ -148,16 +259,15 @@ curl -s -X POST http://localhost:8080/files/signed-url \
 
 ---
 
-## 5. Validation Error - Missing owner_entity_type
+## 9. Validation Error - Missing owner_entity_type
 
 ### Request
 ```bash
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
   -d '{
+    "bucket_id": 1,
     "file_name": "document.pdf",
     "file_size": 1048576,
     "mimetype": "application/pdf",
@@ -175,16 +285,15 @@ curl -s -X POST http://localhost:8080/files/signed-url \
 
 ---
 
-## 6. Validation Error - Missing owner_entity_id
+## 10. Validation Error - Missing owner_entity_id
 
 ### Request
 ```bash
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
   -d '{
+    "bucket_id": 1,
     "file_name": "document.pdf",
     "file_size": 1048576,
     "mimetype": "application/pdf",
@@ -202,13 +311,14 @@ curl -s -X POST http://localhost:8080/files/signed-url \
 
 ---
 
-## 7. Unauthorized Request - No Auth
+## 11. Unauthorized Request - No Auth
 
 ### Request
 ```bash
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Content-Type: application/json" \
   -d '{
+    "bucket_id": 1,
     "file_name": "document.pdf",
     "file_size": 1048576,
     "mimetype": "application/pdf",
@@ -224,17 +334,17 @@ Unauthorized
 
 ---
 
-## 8. Unauthorized Request - Invalid Credentials
+## 12. Unauthorized Request - Invalid Credentials
 
 ### Request
 ```bash
-# Use invalid credentials
-export CREDENTIALS=$(echo -n "invalid-client:invalid-secret" | base64)
+export BAD_CREDENTIALS=$(echo -n "invalid-client:invalid-secret" | base64)
 
 curl -s -X POST http://localhost:8080/files/signed-url \
-  -H "Authorization: Basic $CREDENTIALS" \
+  -H "Authorization: Basic $BAD_CREDENTIALS" \
   -H "Content-Type: application/json" \
   -d '{
+    "bucket_id": 1,
     "file_name": "document.pdf",
     "file_size": 1048576,
     "mimetype": "application/pdf",
@@ -250,7 +360,7 @@ Unauthorized
 
 ---
 
-## 9. Wrong Auth Type - Bearer Token Not Allowed
+## 13. Wrong Auth Type - Bearer Token Not Allowed
 
 Bearer tokens are only for client management, not file operations.
 
@@ -260,6 +370,7 @@ curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Bearer secret-token" \
   -H "Content-Type: application/json" \
   -d '{
+    "bucket_id": 1,
     "file_name": "document.pdf",
     "file_size": 1048576,
     "mimetype": "application/pdf",

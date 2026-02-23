@@ -15,7 +15,7 @@ export PATH=$PATH:/usr/local/go/bin
 go run main.go
 ```
 
-3. A file must already have been uploaded. Use `clients.md`, `files-signed-url.md`, and `files-upload.md` to create a client and upload a file first. Note the `file_id` returned.
+3. A file must already have been uploaded. Use `clients.md`, `buckets.md`, `files-signed-url.md`, and `files-upload.md` to create a client, create a bucket, and upload a file first. Note the `file_id` returned.
 
 ---
 
@@ -35,8 +35,6 @@ Request a signed URL to download a specific file. Valid for 15 minutes.
 
 ### Request
 ```bash
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/download-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
@@ -92,31 +90,39 @@ curl -s -X POST http://localhost:8080/clients \
   -H "Content-Type: application/json" \
   -d '{"name": "my-service"}' | tee /tmp/client.json
 
-# Extract credentials
 export CLIENT_ID=$(cat /tmp/client.json | grep -o '"client_id":"[^"]*"' | cut -d'"' -f4)
 export CLIENT_SECRET=$(cat /tmp/client.json | grep -o '"client_secret":"[^"]*"' | cut -d'"' -f4)
 export CREDENTIALS=$(echo -n "$CLIENT_ID:$CLIENT_SECRET" | base64)
 
-# Step 2: Generate upload signed URL (Basic auth)
+# Step 2: Create a bucket (Basic auth)
+curl -s -X POST http://localhost:8080/buckets \
+  -H "Authorization: Basic $CREDENTIALS" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-downloads"}' | tee /tmp/bucket.json
+
+export BUCKET_ID=$(cat /tmp/bucket.json | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+
+# Step 3: Generate upload signed URL (Basic auth)
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
-  -d '{
-    "file_name": "sample.pdf",
-    "file_size": 10485760,
-    "mimetype": "application/pdf",
-    "owner_entity_type": "user",
-    "owner_entity_id": "user-123"
-  }' | tee /tmp/upload_url.json
+  -d "{
+    \"bucket_id\": $BUCKET_ID,
+    \"file_name\": \"sample.pdf\",
+    \"file_size\": 10485760,
+    \"mimetype\": \"application/pdf\",
+    \"owner_entity_type\": \"user\",
+    \"owner_entity_id\": \"user-123\"
+  }" | tee /tmp/upload_url.json
 
 export FILE_ID=$(cat /tmp/upload_url.json | grep -o '"file_id":"[^"]*"' | cut -d'"' -f4)
 export UPLOAD_TOKEN=$(cat /tmp/upload_url.json | grep -o '"signed_url":"[^"]*"' | grep -o 'token=[^"]*' | cut -d= -f2)
 
-# Step 3: Upload the file (no auth - token in URL)
+# Step 4: Upload the file (no auth - token in URL)
 curl -s -X POST "http://localhost:8080/files/upload?token=$UPLOAD_TOKEN" \
   -F "file=@./sample.pdf"
 
-# Step 4: Generate download signed URL (Basic auth)
+# Step 5: Generate download signed URL (Basic auth)
 curl -s -X POST http://localhost:8080/files/download-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
@@ -124,7 +130,7 @@ curl -s -X POST http://localhost:8080/files/download-url \
 
 export DOWNLOAD_TOKEN=$(cat /tmp/download_url.json | grep -o '"signed_url":"[^"]*"' | grep -o 'token=[^"]*' | cut -d= -f2)
 
-# Step 5: Download the file (no auth - token in URL)
+# Step 6: Download the file (no auth - token in URL)
 curl -s -X GET "http://localhost:8080/files/download?token=$DOWNLOAD_TOKEN" \
   --output ./downloaded-sample.pdf
 
@@ -138,8 +144,6 @@ ls -lh ./downloaded-sample.pdf
 
 ### Missing file_id in request
 ```bash
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/download-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
@@ -155,8 +159,6 @@ curl -s -X POST http://localhost:8080/files/download-url \
 
 ### File not found (wrong file_id)
 ```bash
-export CREDENTIALS=$(echo -n "client_xxx:secret_xxx" | base64)
-
 curl -s -X POST http://localhost:8080/files/download-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \

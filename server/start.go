@@ -100,6 +100,7 @@ func StartServer() {
 	// Initialize handlers
 	clientHandler := handlers.NewClientHandler(dbConn)
 	fileHandler := handlers.NewFileHandler(dbConn, cache)
+	bucketHandler := handlers.NewBucketHandler(dbConn)
 
 	// Create HTTP server with authentication
 	server := httpserver.New("8080", authChecker.CheckAuth)
@@ -138,6 +139,42 @@ func StartServer() {
 		AuthType: "bearer",
 	}, httpserver.HandlerFunc(clientHandler.GetClient))
 
+	// Bucket management routes (Basic auth - client credentials)
+	server.Register(httpserver.Route{
+		Name:     "CreateBucket",
+		Method:   "POST",
+		Path:     "/buckets",
+		AuthType: "basic",
+	}, httpserver.HandlerFunc(bucketHandler.CreateBucket))
+
+	server.Register(httpserver.Route{
+		Name:     "ListBuckets",
+		Method:   "GET",
+		Path:     "/buckets",
+		AuthType: "basic",
+	}, httpserver.HandlerFunc(bucketHandler.GetBuckets))
+
+	server.Register(httpserver.Route{
+		Name:     "GetBucket",
+		Method:   "GET",
+		Path:     "/buckets/{id}",
+		AuthType: "basic",
+	}, httpserver.HandlerFunc(bucketHandler.GetBucket))
+
+	server.Register(httpserver.Route{
+		Name:     "UpdateBucket",
+		Method:   "PUT",
+		Path:     "/buckets/{id}",
+		AuthType: "basic",
+	}, httpserver.HandlerFunc(bucketHandler.UpdateBucket))
+
+	server.Register(httpserver.Route{
+		Name:     "ArchiveBucket",
+		Method:   "POST",
+		Path:     "/buckets/{id}/archive",
+		AuthType: "basic",
+	}, httpserver.HandlerFunc(bucketHandler.ArchiveBucket))
+
 	// File upload routes (Basic auth for signed URL generation)
 	server.Register(httpserver.Route{
 		Name:     "GenerateSignedURL",
@@ -173,6 +210,7 @@ func StartServer() {
 	logger.Info("File Upload Service started on port 8080")
 	logger.Info("Health check: GET /health")
 	logger.Info("Client API: POST/GET /clients, GET /clients/{id} (Bearer auth)")
+	logger.Info("Bucket API: POST/GET /buckets, GET/PUT /buckets/{id}, POST /buckets/{id}/archive (Basic auth)")
 	logger.Info("File API: POST /files/signed-url (Basic auth), POST /files/upload (token in URL)")
 	logger.Info("File API: POST /files/download-url (Basic auth), GET /files/download (token in URL)")
 

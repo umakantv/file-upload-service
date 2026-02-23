@@ -2,6 +2,8 @@
 
 These tests cover the file upload endpoint that uses the token from the URL (no auth header required).
 
+Every upload is associated with a bucket. The bucket is chosen at signed URL generation time and is carried through the upload token.
+
 ## Prerequisites
 
 1. Start Redis server locally:
@@ -15,7 +17,7 @@ export PATH=$PATH:/usr/local/go/bin
 go run main.go
 ```
 
-3. Create a client and get credentials (see `clients.md`), then generate a signed URL (see `files-signed-url.md`) to get a token.
+3. Create a client (see `clients.md`), create a bucket (see `buckets.md`), then generate a signed URL (see `files-signed-url.md`) to get a token.
 
 ---
 
@@ -43,6 +45,7 @@ curl -s -X POST "http://localhost:8080/files/upload?token=102c69213109d22661c87b
   "file_id": "550e8400-e29b-41d4-a716-446655440000",
   "file_name": "document.pdf",
   "file_size": 1048576,
+  "bucket_id": 1,
   "saved_path": "./uploads/550e8400-e29b-41d4-a716-446655440000"
 }
 ```
@@ -161,33 +164,42 @@ Here's the complete workflow from client creation to file upload:
 curl -s -X POST http://localhost:8080/clients \
   -H "Authorization: Bearer secret-token" \
   -H "Content-Type: application/json" \
-  -d '{"name": "my-upload-client"}'
+  -d '{"name": "my-upload-client"}' | tee /tmp/client.json
+
+export CLIENT_ID=$(cat /tmp/client.json | grep -o '"client_id":"[^"]*"' | cut -d'"' -f4)
+export CLIENT_SECRET=$(cat /tmp/client.json | grep -o '"client_secret":"[^"]*"' | cut -d'"' -f4)
+export CREDENTIALS=$(echo -n "$CLIENT_ID:$CLIENT_SECRET" | base64)
 ```
 
-Save the `client_id` and `client_secret` from the response.
-
-### Step 2: Generate Signed URL (Basic auth)
+### Step 2: Create a Bucket (Basic auth)
 ```bash
-# Encode client_id:client_secret in base64
-export CREDENTIALS=$(echo -n "client_id:client_secret" | base64)
+curl -s -X POST http://localhost:8080/buckets \
+  -H "Authorization: Basic $CREDENTIALS" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-uploads"}' | tee /tmp/bucket.json
 
+export BUCKET_ID=$(cat /tmp/bucket.json | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+```
+
+### Step 3: Generate Signed URL (Basic auth)
+```bash
 curl -s -X POST http://localhost:8080/files/signed-url \
   -H "Authorization: Basic $CREDENTIALS" \
   -H "Content-Type: application/json" \
-  -d '{
-    "file_name": "document.pdf",
-    "file_size": 10485760,
-    "mimetype": "application/pdf",
-    "owner_entity_type": "user",
-    "owner_entity_id": "user-123"
-  }'
+  -d "{
+    \"bucket_id\": $BUCKET_ID,
+    \"file_name\": \"document.pdf\",
+    \"file_size\": 10485760,
+    \"mimetype\": \"application/pdf\",
+    \"owner_entity_type\": \"user\",
+    \"owner_entity_id\": \"user-123\"
+  }" | tee /tmp/upload_url.json
+
+export UPLOAD_TOKEN=$(cat /tmp/upload_url.json | grep -o '"signed_url":"[^"]*"' | grep -o 'token=[^"]*' | cut -d= -f2)
 ```
 
-Save the `signed_url` from the response.
-
-### Step 3: Upload File (No auth - token in URL)
+### Step 4: Upload File (No auth - token in URL)
 ```bash
-# Extract token from signed_url (the part after ?token=)
-curl -s -X POST "http://localhost:8080/files/upload?token=EXTRACTED_TOKEN" \
-  -F "file=@./document.pdf"
+curl -s -X POST "http://localhost:8080/files/upload?token=$UPLOAD_TOKEN" \
+  -F "file=@./sample.pdf"
 ```

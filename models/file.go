@@ -12,6 +12,7 @@ type File struct {
 	FileSize        int64          `json:"file_size" db:"file_size"`
 	Mimetype        string         `json:"mimetype" db:"mimetype"`
 	ClientID        string         `json:"client_id" db:"client_id"`
+	BucketID        int            `json:"bucket_id" db:"bucket_id"`
 	OwnerEntityType string         `json:"owner_entity_type" db:"owner_entity_type"`
 	OwnerEntityID   string         `json:"owner_entity_id" db:"owner_entity_id"`
 	CreatedAt       time.Time      `json:"created_at" db:"created_at"`
@@ -19,8 +20,9 @@ type File struct {
 	DeletedAt       sql.NullTime   `json:"deleted_at,omitempty" db:"deleted_at"`
 }
 
-// CreateSignedURLRequest represents the request to generate a signed URL
+// CreateSignedURLRequest represents the request to generate a signed URL for upload
 type CreateSignedURLRequest struct {
+	BucketID        int    `json:"bucket_id"`
 	FileName        string `json:"file_name"`
 	FileSize        int64  `json:"file_size"`
 	Mimetype        string `json:"mimetype"`
@@ -42,6 +44,7 @@ type UploadTokenData struct {
 	FileSize        int64  `json:"file_size"`
 	Mimetype        string `json:"mimetype"`
 	ClientID        string `json:"client_id"`
+	BucketID        int    `json:"bucket_id"`
 	OwnerEntityType string `json:"owner_entity_type"`
 	OwnerEntityID   string `json:"owner_entity_id"`
 }
@@ -57,4 +60,5 @@ type DownloadTokenData struct {
 	FileName string `json:"file_name"`
 	Mimetype string `json:"mimetype"`
 	ClientID string `json:"client_id"`
+	BucketID int    `json:"bucket_id"`
 }

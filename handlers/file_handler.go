@@ -85,6 +85,12 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 	}
 
 	// Validate input
+	if req.BucketID <= 0 {
+		h.logRequest(ctx, "error", "Missing or invalid required field: bucket_id")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("bucket_id is required and must be a positive integer"))
+		return
+	}
 	if req.FileName == "" {
 		h.logRequest(ctx, "error", "Missing required field: file_name")
 		w.WriteHeader(http.StatusBadRequest)
@@ -126,9 +132,39 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 	}
 	clientID := auth.Client
 
+	// Verify the bucket exists, belongs to the authenticated client, and is not archived
+	var bucketClientID string
+	var bucketArchived int
+	err := h.db.QueryRow(
+		"SELECT client_id, archived FROM buckets WHERE id = ?",
+		req.BucketID,
+	).Scan(&bucketClientID, &bucketArchived)
+	if err != nil {
+		h.logRequest(ctx, "error", "Bucket not found", zap.Int("bucket_id", req.BucketID), zap.Error(err))
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(errs.NewNotFoundError("Bucket not found"))
+		return
+	}
+	if bucketClientID != clientID {
+		h.logRequest(ctx, "error", "Bucket does not belong to client",
+			zap.Int("bucket_id", req.BucketID),
+			zap.String("client_id", clientID),
+		)
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(errs.NewAuthorizationError("Access denied: bucket does not belong to your account"))
+		return
+	}
+	if bucketArchived != 0 {
+		h.logRequest(ctx, "error", "Bucket is archived", zap.Int("bucket_id", req.BucketID))
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(errs.NewValidationError("Cannot upload to an archived bucket"))
+		return
+	}
+
 	h.logRequest(ctx, "info", "Generating signed URL",
 		zap.String("file_name", req.FileName),
 		zap.String("client_id", clientID),
+		zap.Int("bucket_id", req.BucketID),
 	)
 
 	// Generate file ID
@@ -136,9 +172,9 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 	now := time.Now()
 
 	// Insert file record into database
-	_, err := h.db.Exec(
-		"INSERT INTO files (id, file_name, file_size, mimetype, client_id, owner_entity_type, owner_entity_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		fileID, req.FileName, req.FileSize, req.Mimetype, clientID, req.OwnerEntityType, req.OwnerEntityID, now, now,
+	_, err = h.db.Exec(
+		"INSERT INTO files (id, file_name, file_size, mimetype, client_id, bucket_id, owner_entity_type, owner_entity_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		fileID, req.FileName, req.FileSize, req.Mimetype, clientID, req.BucketID, req.OwnerEntityType, req.OwnerEntityID, now, now,
 	)
 	if err != nil {
 		h.logRequest(ctx, "error", "Failed to create file record", zap.Error(err))
@@ -158,6 +194,7 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 		FileSize:        req.FileSize,
 		Mimetype:        req.Mimetype,
 		ClientID:        clientID,
+		BucketID:        req.BucketID,
 		OwnerEntityType: req.OwnerEntityType,
 		OwnerEntityID:   req.OwnerEntityID,
 	}
@@ -179,6 +216,7 @@ func (h *FileHandler) GenerateSignedURL(ctx context.Context, w http.ResponseWrit
 	h.logRequest(ctx, "info", "Signed URL generated successfully",
 		zap.String("file_id", fileID),
 		zap.String("client_id", clientID),
+		zap.Int("bucket_id", req.BucketID),
 	)
 
 	// Return signed URL response
@@ -302,6 +340,7 @@ func (h *FileHandler) UploadFile(ctx context.Context, w http.ResponseWriter, r *
 	h.logRequest(ctx, "info", "File uploaded successfully",
 		zap.String("file_id", tokenData.FileID),
 		zap.String("client_id", tokenData.ClientID),
+		zap.Int("bucket_id", tokenData.BucketID),
 		zap.Int64("bytes_written", written),
 	)
 
@@ -313,6 +352,7 @@ func (h *FileHandler) UploadFile(ctx context.Context, w http.ResponseWriter, r *
 		"file_id":    tokenData.FileID,
 		"file_name":  tokenData.FileName,
 		"file_size":  written,
+		"bucket_id":  tokenData.BucketID,
 		"saved_path": filePath,
 	})
 }
@@ -359,9 +399,9 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 	// Look up the file record — verify it exists and belongs to this client
 	var file models.File
 	err := h.db.QueryRow(
-		"SELECT id, file_name, mimetype, client_id FROM files WHERE id = ? AND deleted_at IS NULL",
+		"SELECT id, file_name, mimetype, client_id, bucket_id FROM files WHERE id = ? AND deleted_at IS NULL",
 		req.FileID,
-	).Scan(&file.ID, &file.FileName, &file.Mimetype, &file.ClientID)
+	).Scan(&file.ID, &file.FileName, &file.Mimetype, &file.ClientID, &file.BucketID)
 	if err != nil {
 		h.logRequest(ctx, "info", "File not found", zap.String("file_id", req.FileID), zap.Error(err))
 		w.WriteHeader(http.StatusNotFound)
@@ -400,6 +440,7 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 		FileName: file.FileName,
 		Mimetype: file.Mimetype,
 		ClientID: clientID,
+		BucketID: file.BucketID,
 	}
 
 	if err := h.cache.Set("download:"+downloadToken, tokenData, ttl); err != nil {
@@ -416,6 +457,7 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 	h.logRequest(ctx, "info", "Download signed URL generated successfully",
 		zap.String("file_id", file.ID),
 		zap.String("client_id", clientID),
+		zap.Int("bucket_id", file.BucketID),
 	)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -485,6 +527,7 @@ func (h *FileHandler) DownloadFile(ctx context.Context, w http.ResponseWriter, r
 		zap.String("file_id", tokenData.FileID),
 		zap.String("file_name", tokenData.FileName),
 		zap.String("client_id", tokenData.ClientID),
+		zap.Int("bucket_id", tokenData.BucketID),
 	)
 
 	// Set response headers for file download
