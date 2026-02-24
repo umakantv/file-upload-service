@@ -176,6 +176,22 @@ curl -s -X POST http://localhost:8080/files/download-url \
 
 ---
 
+### File has been deleted (deleted_at set or disk missing)
+```bash
+# Delete the file first using DELETE /files, then request the download URL
+curl -s -X POST http://localhost:8080/files/download-url \
+  -H "Authorization: Basic $CREDENTIALS" \
+  -H "Content-Type: application/json" \
+  -d '{"file_id": "550e8400-e29b-41d4-a716-446655440000"}'
+```
+
+**Expected Response (410 Gone):**
+```json
+{"Code": 422, "Message": "File has been deleted"}
+```
+
+---
+
 ### Access denied (file belongs to a different client)
 ```bash
 # Use credentials of a different client than the one that uploaded the file

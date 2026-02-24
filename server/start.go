@@ -208,6 +208,22 @@ func StartServer() {
 		AuthType: "none",
 	}, httpserver.HandlerFunc(fileHandler.DownloadFile))
 
+	// File list endpoint (Basic auth)
+	server.Register(httpserver.Route{
+		Name:     "ListFiles",
+		Method:   "GET",
+		Path:     "/buckets/{id}/files",
+		AuthType: "basic",
+	}, httpserver.HandlerFunc(fileHandler.ListFiles))
+
+	// File delete endpoint (Basic auth)
+	server.Register(httpserver.Route{
+		Name:     "DeleteFiles",
+		Method:   "DELETE",
+		Path:     "/files",
+		AuthType: "basic",
+	}, httpserver.HandlerFunc(fileHandler.DeleteFiles))
+
 	// Public file access endpoint (no auth, CORS enforced if configured)
 	server.Register(httpserver.Route{
 		Name:     "ServePublicFile",
