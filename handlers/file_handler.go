@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,11 +11,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"file-upload-service/models"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 	"github.com/jmoiron/sqlx"
 	"github.com/umakantv/go-utils/cache"
 	"github.com/umakantv/go-utils/errs"
@@ -428,18 +433,26 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 	var file models.File
 	var clientName string
 	var bucketName string
+	var deletedAt sql.NullTime
 	err := h.db.QueryRow(
-		`SELECT f.id, f.file_name, f.mimetype, f.client_id, f.bucket_id, f.key, c.name, b.name
+		`SELECT f.id, f.file_name, f.mimetype, f.client_id, f.bucket_id, f.key, f.deleted_at, c.name, b.name
 		 FROM files f
 		 JOIN clients c ON f.client_id = c.client_id
 		 JOIN buckets b ON f.bucket_id = b.id
-		 WHERE f.id = ? AND f.deleted_at IS NULL`,
+		 WHERE f.id = ?`,
 		req.FileID,
-	).Scan(&file.ID, &file.FileName, &file.Mimetype, &file.ClientID, &file.BucketID, &file.Key, &clientName, &bucketName)
+	).Scan(&file.ID, &file.FileName, &file.Mimetype, &file.ClientID, &file.BucketID, &file.Key, &deletedAt, &clientName, &bucketName)
 	if err != nil {
 		h.logRequest(ctx, "info", "File not found", zap.String("file_id", req.FileID), zap.Error(err))
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(errs.NewNotFoundError("File not found"))
+		return
+	}
+
+	if deletedAt.Valid {
+		h.logRequest(ctx, "info", "File has been deleted", zap.String("file_id", req.FileID))
+		w.WriteHeader(http.StatusGone)
+		json.NewEncoder(w).Encode(errs.NewValidationError("File has been deleted"))
 		return
 	}
 
@@ -461,12 +474,12 @@ func (h *FileHandler) GenerateDownloadSignedURL(ctx context.Context, w http.Resp
 	// Verify the file exists on disk
 	absFilePath := filepath.Join("./uploads", resolvedFilePath)
 	if _, err := os.Stat(absFilePath); os.IsNotExist(err) {
-		h.logRequest(ctx, "error", "File not found on disk",
+		h.logRequest(ctx, "error", "File missing on disk",
 			zap.String("file_id", file.ID),
 			zap.String("path", absFilePath),
 		)
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(errs.NewNotFoundError("File content not found"))
+		w.WriteHeader(http.StatusGone)
+		json.NewEncoder(w).Encode(errs.NewValidationError("File has been deleted"))
 		return
 	}
 
@@ -581,4 +594,356 @@ func (h *FileHandler) DownloadFile(ctx context.Context, w http.ResponseWriter, r
 	if _, err := io.Copy(w, f); err != nil {
 		h.logRequest(ctx, "error", "Failed to stream file", zap.Error(err))
 	}
+}
+
+// ListFiles handles GET /buckets/{id}/files - list files at a path (non-recursive)
+func (h *FileHandler) ListFiles(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	idStr := vars["id"]
+	bucketID, err := strconv.Atoi(idStr)
+	if err != nil {
+		h.logRequest(ctx, "error", "Invalid bucket ID", zap.String("id", idStr))
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("Invalid bucket ID"))
+		return
+	}
+
+	path := strings.Trim(r.URL.Query().Get("path"), "/")
+
+	clientID := ""
+	if auth := httpserver.GetRequestAuth(ctx); auth != nil {
+		clientID = auth.Client
+	}
+
+	if clientID == "" {
+		h.logRequest(ctx, "error", "Client ID not found in auth context")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(errs.NewAuthenticationError("Authentication required"))
+		return
+	}
+
+	h.logRequest(ctx, "info", "Listing files in bucket", zap.Int("bucket_id", bucketID), zap.String("path", path))
+
+	var bucketClientID string
+	var bucketArchived int
+	if err := h.db.QueryRow("SELECT client_id, archived FROM buckets WHERE id = ?", bucketID).Scan(&bucketClientID, &bucketArchived); err != nil {
+		h.logRequest(ctx, "error", "Bucket not found", zap.Int("bucket_id", bucketID), zap.Error(err))
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(errs.NewNotFoundError("Bucket not found"))
+		return
+	}
+
+	if bucketClientID != clientID {
+		h.logRequest(ctx, "error", "Bucket does not belong to client",
+			zap.Int("bucket_id", bucketID),
+			zap.String("client_id", clientID),
+		)
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(errs.NewAuthorizationError("Access denied: bucket does not belong to your account"))
+		return
+	}
+
+	if bucketArchived != 0 {
+		h.logRequest(ctx, "error", "Bucket is archived", zap.Int("bucket_id", bucketID))
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(errs.NewValidationError("Cannot list files in an archived bucket"))
+		return
+	}
+
+	query := `SELECT id, file_name, file_size, mimetype, key, created_at
+		FROM files
+		WHERE bucket_id = ? AND deleted_at IS NULL`
+	args := []interface{}{bucketID}
+
+	if path == "" {
+		query += " AND key <> ''"
+	} else {
+		query += " AND key LIKE ?"
+		args = append(args, path+"/%")
+	}
+
+	query += " ORDER BY key ASC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.logRequest(ctx, "error", "Failed to query files", zap.Error(err))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to list files"))
+		return
+	}
+	defer rows.Close()
+
+	foldersSet := map[string]struct{}{}
+	files := make([]models.FileListItem, 0)
+	prefix := path
+	if prefix != "" {
+		prefix += "/"
+	}
+
+	for rows.Next() {
+		var file models.FileListItem
+		var key string
+		if err := rows.Scan(&file.ID, &file.FileName, &file.FileSize, &file.Mimetype, &key, &file.CreatedAt); err != nil {
+			h.logRequest(ctx, "error", "Failed to scan file row", zap.Error(err))
+			continue
+		}
+
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+
+		remainder := strings.TrimPrefix(key, prefix)
+		if remainder == "" {
+			continue
+		}
+
+		segments := strings.Split(remainder, "/")
+		if len(segments) == 1 {
+			file.Key = key
+			files = append(files, file)
+		} else {
+			foldersSet[segments[0]] = struct{}{}
+		}
+	}
+
+	folders := make([]string, 0, len(foldersSet))
+	for folder := range foldersSet {
+		folders = append(folders, folder)
+	}
+	sort.Strings(folders)
+
+	response := models.ListFilesResponse{
+		BucketID: bucketID,
+		Path:     path,
+		Files:    files,
+		Folders:  folders,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// DeleteFiles handles DELETE /files - delete files by IDs or by bucket path
+func (h *FileHandler) DeleteFiles(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	var req models.DeleteFilesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logRequest(ctx, "error", "Invalid request body", zap.Error(err))
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("Invalid JSON"))
+		return
+	}
+
+	hasFileIDs := len(req.FileIDs) > 0
+	hasPath := req.Path != nil
+	hasBucketID := req.BucketID != nil
+
+	// Validate: exactly one mode
+	if hasFileIDs && (hasPath || hasBucketID) {
+		h.logRequest(ctx, "error", "Cannot specify both file_ids and bucket_id/path")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("file_ids and path cannot be used together"))
+		return
+	}
+
+	if hasPath && !hasBucketID {
+		h.logRequest(ctx, "error", "bucket_id is required when path is provided")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("bucket_id is required when path is provided"))
+		return
+	}
+
+	if !hasFileIDs && !hasPath {
+		h.logRequest(ctx, "error", "Missing file_ids or path")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("Either file_ids or (bucket_id and path) is required"))
+		return
+	}
+
+	clientID := ""
+	if auth := httpserver.GetRequestAuth(ctx); auth != nil {
+		clientID = auth.Client
+	}
+
+	if clientID == "" {
+		h.logRequest(ctx, "error", "Client ID not found in auth context")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(errs.NewAuthenticationError("Authentication required"))
+		return
+	}
+
+	if hasFileIDs {
+		h.deleteFilesByIDs(ctx, w, clientID, req.FileIDs)
+	} else {
+		h.deleteFilesByPath(ctx, w, clientID, *req.BucketID, *req.Path)
+	}
+}
+
+// deleteFilesByIDs deletes files by their IDs
+func (h *FileHandler) deleteFilesByIDs(ctx context.Context, w http.ResponseWriter, clientID string, fileIDs []string) {
+	h.logRequest(ctx, "info", "Deleting files by IDs", zap.Int("count", len(fileIDs)))
+
+	placeholders := strings.Repeat("?,", len(fileIDs))
+	placeholders = strings.TrimSuffix(placeholders, ",")
+	args := make([]interface{}, 0, len(fileIDs)+1)
+	args = append(args, clientID)
+	for _, id := range fileIDs {
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf(`SELECT f.id, f.key, c.name, b.name
+		FROM files f
+		JOIN clients c ON f.client_id = c.client_id
+		JOIN buckets b ON f.bucket_id = b.id
+		WHERE f.client_id = ? AND f.deleted_at IS NULL AND f.id IN (%s)`, placeholders)
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.logRequest(ctx, "error", "Failed to query files", zap.Error(err))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to delete files"))
+		return
+	}
+	defer rows.Close()
+
+	records := make(map[string]string)
+	for rows.Next() {
+		var fileID, key, clientName, bucketName string
+		if err := rows.Scan(&fileID, &key, &clientName, &bucketName); err != nil {
+			h.logRequest(ctx, "error", "Failed to scan file row", zap.Error(err))
+			continue
+		}
+		records[fileID] = filepath.Join("./uploads", clientName, bucketName, key)
+	}
+
+	deleted, missing, failed := h.removeFiles(ctx, fileIDs, records)
+
+	response := models.DeleteFilesResponse{
+		Deleted: deleted,
+		Missing: missing,
+		Failed:  failed,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// deleteFilesByPath deletes all files in a bucket under the given path
+func (h *FileHandler) deleteFilesByPath(ctx context.Context, w http.ResponseWriter, clientID string, bucketID int, path string) {
+	path = strings.Trim(path, "/")
+
+	h.logRequest(ctx, "info", "Deleting files by path", zap.Int("bucket_id", bucketID), zap.String("path", path))
+
+	// Verify bucket exists and belongs to client
+	var bucketClientID string
+	var bucketArchived int
+	if err := h.db.QueryRow("SELECT client_id, archived FROM buckets WHERE id = ?", bucketID).Scan(&bucketClientID, &bucketArchived); err != nil {
+		h.logRequest(ctx, "error", "Bucket not found", zap.Int("bucket_id", bucketID))
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(errs.NewNotFoundError("Bucket not found"))
+		return
+	}
+
+	if bucketClientID != clientID {
+		h.logRequest(ctx, "error", "Bucket does not belong to client",
+			zap.Int("bucket_id", bucketID),
+			zap.String("client_id", clientID),
+		)
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(errs.NewAuthorizationError("Access denied: bucket does not belong to your account"))
+		return
+	}
+
+	if bucketArchived != 0 {
+		h.logRequest(ctx, "error", "Bucket is archived", zap.Int("bucket_id", bucketID))
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(errs.NewValidationError("Cannot delete files in an archived bucket"))
+		return
+	}
+
+	// Query all files under the given path (recursive)
+	query := `SELECT f.id, f.key, c.name, b.name
+		FROM files f
+		JOIN clients c ON f.client_id = c.client_id
+		JOIN buckets b ON f.bucket_id = b.id
+		WHERE f.bucket_id = ? AND f.client_id = ? AND f.deleted_at IS NULL AND f.key LIKE ?`
+
+	prefix := path + "/%"
+	rows, err := h.db.Query(query, bucketID, clientID, prefix)
+	if err != nil {
+		h.logRequest(ctx, "error", "Failed to query files by path", zap.Error(err))
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(errs.NewInternalServerError("Failed to delete files"))
+		return
+	}
+	defer rows.Close()
+
+	fileIDs := make([]string, 0)
+	records := make(map[string]string)
+	for rows.Next() {
+		var fileID, key, clientName, bucketName string
+		if err := rows.Scan(&fileID, &key, &clientName, &bucketName); err != nil {
+			h.logRequest(ctx, "error", "Failed to scan file row", zap.Error(err))
+			continue
+		}
+		fileIDs = append(fileIDs, fileID)
+		records[fileID] = filepath.Join("./uploads", clientName, bucketName, key)
+	}
+
+	if len(fileIDs) == 0 {
+		h.logRequest(ctx, "error", "No files found at path", zap.String("path", path))
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errs.NewValidationError("No files found at the given path"))
+		return
+	}
+
+	deleted, missing, failed := h.removeFiles(ctx, fileIDs, records)
+
+	response := models.DeleteFilesResponse{
+		Deleted: deleted,
+		Missing: missing,
+		Failed:  failed,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// removeFiles deletes files from disk and marks them deleted in the database.
+// Returns lists of deleted, missing, and failed file IDs.
+func (h *FileHandler) removeFiles(ctx context.Context, fileIDs []string, records map[string]string) (deleted, missing, failed []string) {
+	deleted = make([]string, 0)
+	missing = make([]string, 0)
+	failed = make([]string, 0)
+
+	for _, id := range fileIDs {
+		diskPath, ok := records[id]
+		if !ok {
+			missing = append(missing, id)
+			continue
+		}
+
+		if err := os.Remove(diskPath); err != nil {
+			if os.IsNotExist(err) {
+				missing = append(missing, id)
+				continue
+			}
+			h.logRequest(ctx, "error", "Failed to delete file from disk", zap.String("file_id", id), zap.Error(err))
+			failed = append(failed, id)
+			continue
+		}
+
+		_, err := h.db.Exec("UPDATE files SET deleted_at = ?, updated_at = ? WHERE id = ?", time.Now(), time.Now(), id)
+		if err != nil {
+			h.logRequest(ctx, "error", "Failed to mark file deleted", zap.String("file_id", id), zap.Error(err))
+			failed = append(failed, id)
+			continue
+		}
+
+		deleted = append(deleted, id)
+	}
+
+	return deleted, missing, failed
 }

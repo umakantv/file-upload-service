@@ -70,3 +70,36 @@ type DownloadTokenData struct {
 	// Format: <client_name>/<bucket_name>/<key>  (key may itself contain slashes)
 	FilePath string `json:"file_path"`
 }
+
+// FileListItem represents a file entry in a non-recursive list response
+type FileListItem struct {
+	ID        string    `json:"id"`
+	Key       string    `json:"key"`
+	FileName  string    `json:"file_name"`
+	FileSize  int64     `json:"file_size"`
+	Mimetype  string    `json:"mimetype"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ListFilesResponse represents the list response for a bucket path
+type ListFilesResponse struct {
+	BucketID int            `json:"bucket_id"`
+	Path     string         `json:"path"`
+	Files    []FileListItem `json:"files"`
+	Folders  []string       `json:"folders"`
+}
+
+// DeleteFilesRequest represents a request to delete multiple files.
+// Either file_ids OR (bucket_id + path) must be provided, but not both.
+type DeleteFilesRequest struct {
+	FileIDs  []string `json:"file_ids,omitempty"`
+	BucketID *int     `json:"bucket_id,omitempty"`
+	Path     *string  `json:"path,omitempty"`
+}
+
+// DeleteFilesResponse represents the delete files response
+type DeleteFilesResponse struct {
+	Deleted []string `json:"deleted"`
+	Missing []string `json:"missing"`
+	Failed  []string `json:"failed"`
+}
